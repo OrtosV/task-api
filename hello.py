@@ -1,2 +1,2 @@
 def greet(name: str) -> str:
-    return f"Привет, {name}!"
+    return f"HELLO, {name.upper()}!"
