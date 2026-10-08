@@ -22,11 +22,33 @@ jobs:
       - name: Run tests
         run: pytest -v
 
-  build-image:
+  build-and-push: # job №2 — собрать образ и (только с main) залить его в GHCR
     runs-on: ubuntu-latest
-    needs: test
+    needs: test                # стартует только если тесты прошли
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build -t task-api:${{ github.sha }} .
+      - name: Prepare image name
+        # ник на GitHub может быть с заглавными буквами, а docker принимает адрес
+        # образа только в нижнем регистре — приводим сами
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE=ghcr.io/$OWNER_LOWER/task-api" >> $GITHUB_ENV
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'    # на pull request в реестр не ходим
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          # на PR только собираем (проверка, что Dockerfile жив), заливаем лишь с main
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest

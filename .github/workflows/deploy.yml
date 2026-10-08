@@ -1,0 +1,55 @@
+name: Deploy
+
+on:
+  workflow_run:                # стартуем, когда отработал другой workflow
+    workflows: [CI]            # имя из строки name: в ci.yml
+    types: [completed]         # в момент, когда CI закончил работу
+    branches: [main]           # и только если это был main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # CI закончился — но чем? Едем на сервер только если зелёным
+    if: github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Prepare image name
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE=ghcr.io/$OWNER_LOWER/task-api" >> $GITHUB_ENV
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # команды ниже выполняются НА сервере
+            # логинимся в реестр, чтобы стянуть приватный образ
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # тянем образ, который CI уже собрал и проверил тестами
+            docker pull ${{ env.IMAGE }}:latest
+
+            # сносим старый контейнер, если был
+            docker rm -f task-api 2>/dev/null || true
+
+            # поднимаем новый в фоне
+            docker run -d \
+              --name task-api \
+              --restart unless-stopped \
+              -p 80:8000 \
+              -e LOG_LEVEL=INFO \
+              ${{ env.IMAGE }}:latest
+
+            # убеждаемся, что контейнер действительно жив, и только тогда чистим диск
+            sleep 5
+            if [ -n "$(docker ps -q -f name=task-api -f status=running)" ]; then
+              docker image prune -f
+            else
+              echo "Контейнер не поднялся"
+              docker logs --tail 50 task-api
+              exit 1
+            fi
+
+            docker logout ghcr.io
