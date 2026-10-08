@@ -33,7 +33,7 @@ async def test_create_task_invalid(client, payload):
 
 async def test_list_empty(client):
     response = await client.get("/tasks")
-    assert response.status_code == 500
+    assert response.status_code == 200
     assert response.json() == []
 
 
