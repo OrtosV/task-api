@@ -1,55 +1,47 @@
-name: Deploy
+name: CI/CD
 
 on:
-  workflow_run:                # стартуем, когда отработал другой workflow
-    workflows: [CI]            # имя из строки name: в ci.yml
-    types: [completed]         # в момент, когда CI закончил работу
-    branches: [main]           # и только если это был main
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
-  deploy:
+  test:
     runs-on: ubuntu-latest
-    # CI закончился — но чем? Едем на сервер только если зелёным
-    if: github.event.workflow_run.conclusion == 'success'
     steps:
-      - name: Prepare image name
-        run: |
-          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          echo "IMAGE=ghcr.io/$OWNER_LOWER/task-api" >> $GITHUB_ENV
-
-      - name: Deploy to server
-        uses: appleboy/ssh-action@v1.0.3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: pytest tests/ -v
+        env:
+          # Только секрет. Остальное (base URL, model, top_k, эмбеддер) —
+          # дефолты из app/config.py, общие для CI / локали / прода.
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          QDRANT_URL: http://localhost:6333
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ... существующие шаги build + push в GHCR из недели 6
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            # команды ниже выполняются НА сервере
-            # логинимся в реестр, чтобы стянуть приватный образ
-            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-            # тянем образ, который CI уже собрал и проверил тестами
-            docker pull ${{ env.IMAGE }}:latest
-
-            # сносим старый контейнер, если был
-            docker rm -f task-api 2>/dev/null || true
-
-            # поднимаем новый в фоне
-            docker run -d \
-              --name task-api \
-              --restart unless-stopped \
-              -p 127.0.0.1:8000:8000 \
-              -e LOG_LEVEL=INFO \
-              ${{ env.IMAGE }}:latest
-
-            # убеждаемся, что контейнер действительно жив, и только тогда чистим диск
-            sleep 5
-            if [ -n "$(docker ps -q -f name=task-api -f status=running)" ]; then
-              docker image prune -f
-            else
-              echo "Контейнер не поднялся"
-              docker logs --tail 50 task-api
-              exit 1
-            fi
-
-            docker logout ghcr.io
+            cd /opt/mentoring/rag-service
+            # Только секреты. Имя модели, base URL, top_k и т.д.
+            # — дефолты из app/config.py.
+            cat > .env << 'EOF'
+            LLM_API_KEY=${{ secrets.LLM_API_KEY }}
+            QDRANT_URL=http://qdrant:6333
+            EOF
+            docker compose pull app
+            docker compose up -d app
