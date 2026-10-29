@@ -6,11 +6,24 @@ pytest>=8.0
 pytest-asyncio>=0.23
 httpx>=0.27
 
-# ML stack
-scikit-learn==1.6.1
-pandas==2.2.3
-numpy==2.0.2
-joblib==1.4.2
-
 # UI
 gradio==5.50.0
+
+langchain-openai>=0.2.0
+pydantic-settings>=2.2
+
+langchain-community>=0.3.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+langchain-text-splitters>=0.3.0
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+langchain-huggingface>=0.1.0
+langchain-qdrant>=0.2.0
+sentence-transformers>=3.0.0
+qdrant-client>=1.12.0
+
+ragas==0.2.15
+langchain-community<0.4.0
+datasets>=3.0.0
