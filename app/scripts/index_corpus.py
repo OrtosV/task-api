@@ -112,7 +112,7 @@ def main() -> None:
         )
 
         client.update_collection_aliases(
-            change_aliases=operations
+            change_aliases_operations=operations
         )
 
         print(

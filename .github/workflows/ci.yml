@@ -1,0 +1,71 @@
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test-and-publish:
+    runs-on: ubuntu-latest
+
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.12.0
+        ports:
+          - 6333:6333
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Wait for Qdrant
+        run: |
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://localhost:6333/healthz; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Qdrant did not become ready"
+          exit 1
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ghcr.io/ortosv/task-api:${GITHUB_SHA} .
+
+      - name: Run tests inside Docker image
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          docker run --rm \
+            --network host \
+            -v "${GITHUB_WORKSPACE}/tests:/tests:ro" \
+            -e LLM_API_KEY \
+            -e QDRANT_URL=http://127.0.0.1:6333 \
+            ghcr.io/ortosv/task-api:${GITHUB_SHA} \
+            sh -c "pip install --no-cache-dir pytest && python -m pytest /tests -v"
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish tested image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ghcr.io/ortosv/task-api:${GITHUB_SHA}
+          docker tag \
+            ghcr.io/ortosv/task-api:${GITHUB_SHA} \
+            ghcr.io/ortosv/task-api:latest
+          docker push ghcr.io/ortosv/task-api:latest
