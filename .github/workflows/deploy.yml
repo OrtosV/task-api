@@ -1,83 +1,33 @@
 
-name: CI/CD
+name: Deploy
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    services:
-      qdrant:
-        image: qdrant/qdrant:v1.12.0
-        ports:
-          - 6333:6333
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run tests
-        run: pytest tests/ -v
-        env:
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          QDRANT_URL: http://localhost:6333
-
-  build:
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/ortosv/task-api:latest
-            ghcr.io/ortosv/task-api:${{ github.sha }}
-
   deploy:
-    needs: build
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy to VPS
+      - name: Deploy tested image to VPS
         uses: appleboy/ssh-action@v1
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-          RELEASE_TAG: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_sha }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
@@ -86,18 +36,27 @@ jobs:
           script: |
             set -eu
 
+            APP_DIR=/opt/mentoring/rag-service
+            ENV_FILE="$APP_DIR/.env"
+            OLD_TAG=""
+
             mkdir -p /opt/mentoring
 
-            if [ ! -d /opt/mentoring/rag-service/.git ]; then
-              rm -rf /opt/mentoring/rag-service
-              git clone https://github.com/OrtosV/task-api.git \
-                /opt/mentoring/rag-service
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone https://github.com/OrtosV/task-api.git "$APP_DIR"
             fi
 
-            cd /opt/mentoring/rag-service
-            git fetch origin main
-            git reset --hard origin/main
+            cd "$APP_DIR"
 
+            # Сохраняем тег предыдущей версии, если он есть.
+            if [ -f "$ENV_FILE" ]; then
+              OLD_TAG=$(sed -n 's/^IMAGE_TAG=//p' "$ENV_FILE" | head -n 1)
+            fi
+
+            git fetch origin main
+            git checkout --force --detach "$RELEASE_TAG"
+
+            # Восстанавливаем конфигурацию приложения для нового релиза.
             cat > .env <<EOF
             LLM_API_KEY=$LLM_API_KEY
             QDRANT_URL=http://qdrant:6333
@@ -110,21 +69,53 @@ jobs:
             docker compose pull app
             docker compose up -d qdrant
 
-            # Проверяем, что новый образ импортирует приложение.
-            docker compose run --rm --no-deps app \
-              python -c "from app.main import app; print('Import OK')"
+            rollback() {
+              echo "Deployment failed; attempting rollback."
 
-            # Индексируем корпус в новой коллекции.
-            # Оба скрипта выполняются в одном контейнере.
+              if [ -n "$OLD_TAG" ]; then
+                cat > .env <<EOF
+            LLM_API_KEY=$LLM_API_KEY
+            QDRANT_URL=http://qdrant:6333
+            IMAGE_TAG=$OLD_TAG
+            EOF
+
+                docker compose pull app || true
+                docker compose up -d --no-deps app || true
+
+                for i in $(seq 1 12); do
+                  if curl --fail --silent \
+                    http://127.0.0.1:8000/health; then
+                    echo "Previous version restored."
+                    return 0
+                  fi
+                  sleep 5
+                done
+
+                echo "Rollback attempted, but health check failed."
+              else
+                echo "No previous image tag found; automatic rollback unavailable."
+              fi
+
+              return 1
+            }
+
+            # Останавливаем старое приложение перед переиндексацией.
             docker compose stop app || true
-            docker compose run --rm --no-deps app sh -c \
+
+            # Формируем корпус и создаём новый индекс.
+            if ! docker compose run --rm --no-deps app sh -c \
               "python -m app.scripts.load_corpus && \
-               python -m app.scripts.index_corpus"
+               python -m app.scripts.index_corpus"; then
+              rollback || true
+              exit 1
+            fi
 
-            # Переключаем приложение на новый образ.
-            docker compose up -d --no-deps app
+            # Запускаем новую версию.
+            if ! docker compose up -d --no-deps app; then
+              rollback || true
+              exit 1
+            fi
 
-            # Ждём готовности API и проверяем health endpoint.
             healthy=0
             for i in $(seq 1 30); do
               if curl --fail --silent \
@@ -137,9 +128,9 @@ jobs:
 
             if [ "$healthy" -ne 1 ]; then
               docker compose logs --tail=100 app
+              rollback || true
               exit 1
             fi
 
-            # Удаляем неиспользуемые образы, не затрагивая тома Qdrant.
             docker image prune -f
             docker logout ghcr.io
